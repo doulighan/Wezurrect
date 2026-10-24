@@ -42,7 +42,7 @@ Fork of MLFlexer/resurrect.wezterm with Windows fixes, security hardening, and C
 - A Claude session is live when a control file `~/.claude/sessions/<pid>.json` names it, that pid is running, and the process start time equals the file's `procStart`. Live or unknown = not resumed (fail closed)
 - Also unknown: an empty control folder; an id with no control file while a running session has the same cwd (ids rotate on compaction); a query that took over 10 seconds
 - A Claude line is typed only when the saved command is exactly `<claude binary> --resume <lower-case UUID> [--dangerously-skip-permissions]`; the typed line is rebuilt from those parts, never copied from the state file. `claude --continue` is never typed
-- `restore_guard.run_query` is the only function that asks the OS (one PowerShell call, Windows only). Tests replace it
+- `restore_guard.run_query` is the only function that asks the OS (one PowerShell call on Windows, one /bin/sh call on macOS; refused elsewhere). Tests replace it
 - "Browse named saves" restores every kind of save into a new window; the startup selector's blank window is the only pre-existing pane ever reused, and only via `restore_opts.startup_pane_id`
 - A restore only types into panes it created (`opts.pane_is_new`); never into a pane that already existed
 - A claimed session is never resumed again while the claim holds (`claim_ttl_seconds` or while its pane exists). In-process claims live in `wezterm.GLOBAL` (flat keys `resurrect_resume_claim_<id>` / `_pane_<id>`) so a reload keeps them; across GUI processes a claim file `~/.wezurrect/resuming/<id>` is created by temp-write + rename (fails if it exists on Windows), refreshed by a heartbeat, and taken over when stale

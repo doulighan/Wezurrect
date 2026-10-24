@@ -96,6 +96,59 @@ local QUERY_SCRIPT = table.concat({
 	"[Console]::Out.Flush(); [Environment]::Exit(0) } }",
 	"catch { ('ERR', $_.Exception.Message) -join $t }",
 }, " ")
+-- The same query for macOS, as a /bin/sh script: $1 is the marker folder,
+-- the rest are the control folders. Only tools that ship with macOS (plutil
+-- reads JSON). Claude writes procStart there as `ps -o lstart` text in UTC,
+-- for example "Sat Oct 24 00:31:04 2026"; both it and the measured start
+-- time are printed as FILETIME, so classify compares them as on Windows. A
+-- procStart that does not parse is printed as it is, which reads as unknown.
+-- ps exits 1 for a pid that is not running; any other failure is unknown.
+local MAC_QUERY_SCRIPT = [==[
+export LC_ALL=C
+field() { /usr/bin/plutil -extract "$1" raw -o - "$2" 2>/dev/null | /usr/bin/tr -d '\t\r\n'; }
+filetime() {
+	s=$(TZ=UTC /bin/date -j -f '%a %b %e %T %Y' "$1" +%s 2>/dev/null) || return 1
+	echo $(( (s + 11644473600) * 10000000 ))
+}
+md=$1; shift
+n=0; first=1
+for d in "$@"; do
+	if [ ! -d "$d" ]; then
+		if [ $first = 1 ]; then printf 'ERR\tcontrol directory not found\n'; exit 0; fi
+		continue
+	fi
+	first=0
+	for f in "$d"/*.[jJ][sS][oO][nN]; do
+		[ -f "$f" ] || continue
+		n=$((n + 1))
+		sid=$(field sessionId "$f"); id=$(field pid "$f"); ps=$(field procStart "$f"); cwd=$(field cwd "$f")
+		case $id in '' | *[!0-9]*) b=${f##*/}; id=${b%.*} ;; esac
+		ps=$(filetime "$ps") || ps=$(printf '%s' "$ps" | /usr/bin/tr -cd ' -~')
+		run=1; st='?'
+		case $id in '' | *[!0-9]*) ;; *)
+			lstart=$(TZ=UTC /bin/ps -o lstart= -p "$id" 2>/dev/null); rc=$?
+			if [ $rc = 1 ]; then run=0
+			elif [ $rc = 0 ]; then st=$(filetime "$lstart") || st='?'
+			fi ;;
+		esac
+		printf 'S\t%s\t%s\t%s\t%s\t%s\t%s\n' "$sid" "$id" "$ps" "$run" "$st" "$cwd"
+	done
+done
+m=0
+if [ -e "$md" ]; then
+	if [ ! -d "$md" ]; then printf 'ERR\tno-restore marker folder unreadable: the path is not a folder\n'; exit 0; fi
+	if [ ! -r "$md" ] || [ ! -x "$md" ]; then printf 'ERR\tno-restore marker folder unreadable: permission denied\n'; exit 0; fi
+	for f in "$md"/*.[jJ][sS][oO][nN] "$md"/.*.[jJ][sS][oO][nN]; do
+		[ -e "$f" ] || continue
+		m=$((m + 1))
+		b=${f##*/}
+		r=$(field reason "$f" | /usr/bin/tr -cd ' -~'); by=$(field by "$f" | /usr/bin/tr -cd ' -~')
+		printf 'M\t%s\t%s\t%s\n' "${b%.*}" "$r" "$by"
+	done
+fi
+printf 'END\t%s\t%s\n' "$n" "$m"
+]==]
+
 --- Ask the operating system which Claude control files exist and whether the
 --- process each one names is running. THE ONLY PLACE THIS MODULE TOUCHES THE
 --- OS; everything else works on the text it returns.
@@ -138,10 +191,22 @@ local QUERY_SCRIPT = table.concat({
 ---@return string|nil stdout
 ---@return string|nil err
 function pub.run_query(dirs, marker_dir)
+	if utils.is_mac then
+		local args = { "/bin/sh", "-c", MAC_QUERY_SCRIPT, "wezurrect-query", marker_dir or pub.marker_dir() }
+		for _, dir in ipairs(dirs) do
+			table.insert(args, dir)
+		end
+		local success, stdout, stderr = wezterm.run_child_process(args)
+		if not success then
+			return nil, "/bin/sh failed: " .. tostring(stderr)
+		end
+		return stdout
+	end
 	if not utils.is_windows then
-		-- procStart is encoded per platform and only the Windows encoding has
-		-- been checked against real files. Unknown means "do not resume".
-		return nil, "the running-session check is only implemented on Windows"
+		-- procStart is encoded per platform and only the Windows and macOS
+		-- encodings have been checked against real files. Unknown means "do
+		-- not resume".
+		return nil, "the running-session check is only implemented on Windows and macOS"
 	end
 	local quoted = {}
 	for _, dir in ipairs(dirs) do
@@ -665,6 +730,10 @@ local function claim_content(session_id, pane_id)
 end
 
 -- Create path with content only if it does not exist yet.
+local function shell_quote(s)
+	return "'" .. s:gsub("'", "'\\''") .. "'"
+end
+
 local function create_new(path, content)
 	local tmp = path .. ".tmp-" .. claim_owner() .. "-" .. tostring(math.random(100000000, 999999999))
 	local handle = io.open(tmp, "wb")
@@ -673,6 +742,12 @@ local function create_new(path, content)
 	end
 	handle:write(content)
 	handle:close()
+	if not utils.is_windows then
+		-- rename() replaces an existing file here; link() refuses to.
+		local ok = os.execute("/bin/ln " .. shell_quote(tmp) .. " " .. shell_quote(path) .. " 2>/dev/null")
+		os.remove(tmp)
+		return ok == true
+	end
 	local ok = os.rename(tmp, path)
 	if not ok then
 		os.remove(tmp)
@@ -831,8 +906,8 @@ end
 ---@return boolean ok
 ---@return string|nil reason when not ok
 local function claim_file(session_id, pane_id)
-	if not utils.is_windows then
-		return false, "cross-process claims are only implemented on Windows"
+	if not utils.is_windows and not utils.is_mac then
+		return false, "cross-process claims are only implemented on Windows and macOS"
 	end
 	local dir = pub.claim_dir()
 	if not utils.ensure_folder_exists(dir) then
